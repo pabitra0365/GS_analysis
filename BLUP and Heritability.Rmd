@@ -1,0 +1,97 @@
+### BLUP and Heritability Analysis
+
+## Load required library
+```{r}
+library(lmerTest)
+
+##Define the heritability function
+h2lmer <- function(x.lmer, id, nrep){
+  gen.var <- VarCorr(x.lmer)[[id]][1,1]  # Genetic variance
+  err.var <- sigma(x.lmer)^2  # Error variance
+  h2 <- gen.var / (gen.var + err.var / nrep)  # Heritability formula
+  return(h2)
+}
+
+
+
+
+# Load data
+dd <- read_excel("~/Downloads/DB_BLUP_Calculation/DBPhenodata copy.xlsx")
+
+# Convert 'Line' and 'Rep' to factors
+dd$Line <- as.factor(dd$Line)
+dd$Rep <- as.factor(dd$Rep)
+
+# View summary of the dataset
+summary(dd)
+
+
+
+# Fit the LMM for the entire dataset
+Norm_DB_ALL.lmer <- lmer(DB ~ (1|Line) + (1|Rep), dd)
+
+# View summary of the fitted model
+summary(Norm_DB_ALL.lmer)
+
+# Calculate heritability for the 'Line' effect (assuming 2 replications)
+h2lmer(Norm_DB_ALL.lmer, "Line", 2)
+
+# Calculate BLUPs
+blup <- fixef(Norm_DB_ALL.lmer) + ranef(Norm_DB_ALL.lmer)$Line
+head(blup)
+
+
+
+
+# Initialize LMM for all columns starting from the 3rd (traits)
+lmer.list <- lapply(3:ncol(dd), function(x){
+  tt <- dd[c(1, 2, x)]
+  names(tt)[3] <- "temp"
+  lmer(temp ~ (1|Line) + (1|Rep), tt)
+})
+
+# Name each LMM in the list based on the column names
+names(lmer.list) <- names(dd)[3:ncol(dd)]
+
+# Calculate heritability for each trait
+h2.list <- sapply(lmer.list, function(x) h2lmer(x, "Line", 2))
+
+# Calculate BLUPs for each trait
+blup.list <- sapply(lmer.list, function(x) {
+  bb <- fixef(x) + ranef(x)$Line
+  bb[, 1]
+})
+
+# Assign row names for BLUP list based on 'Line'
+rownames(blup.list) <- levels(dd$Line)
+
+# View the first few rows of the BLUP list
+head(blup.list)
+
+
+
+# Write BLUPs to a file
+write.table(blup.list, "DB_ALL-BLUPs.txt", sep = "\t", quote = FALSE)
+
+# Write heritability values to a file
+write.table(h2.list, "DB_ALL_BLUP-Broad_heritability.txt", sep = "\t", quote = FALSE)
+
+
+# Define a custom summary function
+mysummary <- function(data) {
+  st <- function(x) c(length(na.omit(x)), mean(x, na.rm = TRUE), sd(x, na.rm = TRUE), 
+                      min(x, na.rm = TRUE), quantile(x, c(0.25, 0.5, 0.75), na.rm = TRUE), 
+                      max(x, na.rm = TRUE), sum(is.na(x)))
+  ss <- apply(data, 2, st)
+  row.names(ss) <- c("N", "Mean", "Std.Dev", "Min", "Q1", "Median", "Q3", "Max", "Missing")
+  t(ss)
+}
+
+# Get summary statistics for the BLUP list
+mysummary(blup.list)
+
+# Write summary statistics to a file
+write.table(mysummary(blup.list), "DB_ALL.BLUP.summary.txt", sep = "\t", quote = FALSE)
+
+
+```
