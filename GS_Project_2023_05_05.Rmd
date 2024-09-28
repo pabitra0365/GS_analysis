@@ -1,0 +1,213 @@
+---
+title: "Genomic Prediction basic Analaysis"
+author: "Pabitra Joshi"
+date: "2023-05-05"
+---
+
+## Load Required Packages
+```{r}
+library(gaston)
+library(rrBLUP)
+library(sommer)
+library(tidyverse)
+```
+
+##Load and Process VCF Data
+```{r}
+
+impVCF <- read.vcf("Imputation/GST3_genotypes_imputed.vcf.gz")
+allM <- as.matrix(impVCF)
+
+# Sort rows of allM by line names
+allM <- allM[sort(row.names(allM)),]
+
+# Check for missing data
+any(is.na(allM))
+
+# Convert major allele counts to minor allele counts if needed
+swap.scores <- function(col) {
+  if (mean(col) > 1) return(abs(col - 2))
+  return(col)
+}
+M <- apply(allM, MARGIN = 2, FUN = swap.scores)
+
+
+```
+
+##Remove Fixed Markers
+
+```{r}
+maf <- apply(M, MARGIN = 2, FUN = function(x) mean(x) / 2)
+fixed.markers <- which(maf == 0)
+M <- M[, -fixed.markers]
+
+```
+
+
+###Principal Component Analysis (PCA)
+
+```{r}
+pcs <- prcomp(M, scale = TRUE, center = TRUE)
+pc.vars <- data.frame(PC.num = 1:length(pcs$sdev), var = (pcs$sdev)^2 / sum((pcs$sdev)^2))
+ggplot(pc.vars, aes(x = PC.num, y = var)) + geom_point() + geom_line() + labs(title = "Scree plot of PC variances")
+
+```
+
+##Population Structure Visualization
+```{r}
+line.orig <- data.frame(line = row.names(M)) %>%
+  mutate(group = ifelse(grepl("^[0-9]", substr(line, 1, 2)), "XX", substr(line, 1, 2)))
+
+data.for.PC.plot <- data.frame(pcs$x) %>%
+  mutate(line = row.names(pcs$x)) %>%
+  merge(line.orig, by = "line")
+
+ggplot(data.for.PC.plot, aes(x = PC1, y = PC2, color = group)) + geom_point(size = 4, alpha = 0.7) + scale_color_viridis_d(option = "H")
+
+```
+
+
+##Genomic Relationship Matrix (G Matrix)
+```{r}
+M.cent <- scale(M, center = TRUE, scale = FALSE)
+cov.mat <- M.cent %*% t(M.cent)
+maf <- apply(M, MARGIN = 2, FUN = function(x) mean(x) / 2)
+denom <- as.numeric(2 * (t(maf) %*% (1 - maf)))
+G <- cov.mat / denom
+
+```
+
+
+##Genomic Best Linear Unbiased Prediction (GBLUP)
+```{r}
+
+all.pheno <- read.csv("pheno.csv", row.names = 1)
+y.across <- all.pheno$BLUPsGPC
+y.across <- y.across[row.names(G)]
+
+GBLUP <- mixed.solve(y = y.across, K = G)
+GEBVs <- GBLUP$u + as.integer(GBLUP$beta)
+
+# Visualize Predicted vs Observed Yield
+gblup.df <- data.frame(line = names(GEBVs), gblup = GEBVs) %>%
+  merge(data.frame(line = names(y.across), observed = y.across), by = "line")
+
+ggplot(gblup.df, aes(x = observed, y = gblup)) + geom_point(size = 4, alpha = 0.7) + geom_abline(slope = 1, intercept = 0, color = "red")
+
+```
+
+##Cross-Validation
+```{r}
+set.seed(1234)
+folds <- sample(rep(1:10, length.out = nrow(G)))
+
+gblup.cv <- function(fold) {
+  y.train <- y.across
+  y.train[folds == fold] <- NA
+  model <- mixed.solve(y = y.train, K = G)
+  preds <- model$u[folds == fold] + as.numeric(model$beta)
+  cor(preds, y.across[folds == fold])
+}
+
+cv_results <- sapply(1:10, gblup.cv)
+mean(cv_results)
+
+```
+
+
+##Ridge Regression BLUP (rrBLUP)
+
+```{r}
+train <- y.across
+train[folds == 10] <- NA
+train.fit <- mixed.solve(y = train, Z = M - 1)
+test.preds <- (M[folds == 10, ] - 1) %*% train.fit$u + as.numeric(train.fit$beta)
+cor(test.preds, y.across[folds == 10])
+```
+
+
+##Multivariate GBLUP
+```{r}
+
+across.traits <- all.pheno %>%
+  pivot_wider(names_from = "TRAIT", values_from = "BLUEs") %>%
+  mutate(Fold = folds)
+
+mgblup <- mmer(cbind(Yield, TW, HT) ~ 1, random = ~vsr(line, Gu = G, Gtc = unsm(3)),
+               rcov = ~vsr(units, Gtc = unsm(3)), data = across.traits)
+
+mv.preds <- do.call(cbind, mgblup$U$u)
+mv.preds <- mv.preds + matrix(data = 1, nrow = nrow(M), ncol = 3) %*% diag(mgblup$Beta$Estimate)
+cor(mv.preds[, "Yield"], y.across)
+
+
+```
+
+
+
+##Multitrait RKHS
+```{r}
+library(BGLR)
+
+
+# Define the input file paths (just the file names since they are in the same folder)
+genot_path <- "genot.csv"
+pheno_path <- "pheno.csv"
+
+# Read in the genotype and phenotype data
+genot <- read.csv(genot_path, row.names = 1)  # Genotype data
+pheno <- read.csv(pheno_path, row.names = 1)  # Phenotype data
+
+# Ensure the genotype and phenotype data are matrices
+genot <- as.matrix(genot)
+pheno <- as.matrix(pheno)
+
+# Calculate the Gaussian kernel (K) based on the genotype data
+D <- as.matrix(dist(genot))  # Calculate the Euclidean distance matrix
+D <- D^2  # Square the distance matrix
+theta <- 0.5 * mean(D)  # Calculate the bandwidth for the Gaussian kernel
+K <- exp(-D / theta)  # Compute the Gaussian kernel
+
+# Prepare the number of samples and traits
+n <- nrow(pheno)  # Number of samples (genotypes)
+n_traits <- ncol(pheno)  # Number of traits (columns)
+
+# Set the number of iterations for the Bayesian model
+nIter <- 50  # Total number of iterations
+burnIn <- 10  # Number of burn-in iterations
+
+# Initialize an array to store the results for each trait
+Results <- array(NA, dim = c(n, n_traits))
+
+# Loop through each trait and apply the RKHS model
+for (i in 1:n_traits) {
+  y <- pheno[, i]  # Select the i-th trait from the phenotype data
+  fm <- BGLR(y = y, ETA = list(list(K = K, model = "RKHS")), nIter = nIter, burnIn = burnIn)
+  
+  # Store the predicted values in the Results array
+  Results[, i] <- fm$yHat
+}
+
+
+
+# Calculate prediction accuracy (correlation between observed and predicted) for each trait
+Accuracy <- numeric(n_traits)
+for (i in 1:n_traits) {
+  Accuracy[i] <- cor(Results[, i], pheno[, i], use = "complete.obs")  # Correlation
+}
+
+# Print the accuracy for each trait
+print(Accuracy)
+
+# Define the output file path and save the predicted results
+output_path <- paste0("RKHS_predictions_", Sys.Date(), ".csv")
+write.csv(Results, output_path)
+
+
+
+
+# Define the output file path and save the predicted results
+output_path <- paste0("RKHS_predictions_", Sys.Date(), ".csv")
+write.csv(Results, output_path)
+
+```
